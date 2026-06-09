@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections import namedtuple
 import torch
 from torch import nn, tensor
-from torch.nn import Module, Linear
+from torch.nn import Module, Linear, ModuleList
 import torch.nn.functional as F
 
-from einops import einsum
+from einops import einsum, reduce
 from einops.layers.torch import Rearrange
 
 from x_transformers import Decoder
@@ -26,6 +27,34 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+# return types
+
+AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown'])
+
+# feedforward
+
+def FeedForward(dim, expansion_factor = 4.):
+    dim_inner = int(dim * expansion_factor)
+    return nn.Sequential(
+        nn.RMSNorm(dim),
+        nn.Linear(dim, dim_inner),
+        nn.GELU(),
+        nn.Linear(dim_inner, dim)
+    )
+
+# embedding
+
+def PatchEmbedding(dim, patch_size, channels = 3):
+    patch_dim = channels * (patch_size ** 2)
+
+    return nn.Sequential(
+        Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_size, p2 = patch_size),
+        nn.RMSNorm(patch_dim),
+        Linear(patch_dim, dim),
+        nn.RMSNorm(dim),
+    )
+
 # attention
 
 class Attention(Module):
@@ -41,6 +70,8 @@ class Attention(Module):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
+
+        self.norm = nn.RMSNorm(dim)
 
         self.to_qkv = Linear(dim, dim_inner * 3, bias = False)
         self.combine_heads = Linear(dim_inner, dim, bias = False)
@@ -61,6 +92,8 @@ class Attention(Module):
         pre_softmax_attn_gates = None,
         post_softmax_attn_gates = None
     ):
+        tokens = self.norm(tokens)
+
         tokens, inverse_pack = pack_with_inverse(tokens, 'b * d')
 
         q, k, v = self.to_qkv(tokens).chunk(3, dim = -1)
@@ -77,9 +110,11 @@ class Attention(Module):
         # the proposal
 
         aux_loss = self.zero
+        aux_loss_breakdown = (self.zero, self.zero)
+        indices = None
 
         if exists(self.attn_schema):
-            sim, indices, aux_loss = self.attn_schema(orig_sim)
+            sim, indices, aux_loss, aux_loss_breakdown = self.attn_schema(orig_sim)
 
         if self.attn_add_residual:
             sim = sim + orig_sim
@@ -109,7 +144,7 @@ class Attention(Module):
 
         attended = inverse_pack(attended)
 
-        return attended, indices, aux_loss
+        return AttentionReturn(attended, indices, aux_loss, aux_loss_breakdown)
 
 # attention autoencoder
 
@@ -122,6 +157,8 @@ class AttentionSchema(Module):
         detach_target = True,
         encoder: Module | None = None,
         decoder: Module | None = None,
+        recon_loss_weight = 1.,
+        commit_loss_weight = 1.,
         **vq_kwargs
     ):
         super().__init__()
@@ -140,6 +177,9 @@ class AttentionSchema(Module):
 
         self.kl_div_loss = kl_div_loss
         self.detach_target = detach_target
+
+        self.recon_loss_weight = recon_loss_weight
+        self.commit_loss_weight = commit_loss_weight
 
     def forward(
         self,
@@ -167,7 +207,7 @@ class AttentionSchema(Module):
             if self.kl_div_loss:
                 recon_loss = F.kl_div(
                     attn_sim.log_softmax(dim = -1),
-                    recon,
+                    recon.softmax(dim = -1),
                     reduction = 'batchmean'
                 )
             else:
@@ -175,17 +215,79 @@ class AttentionSchema(Module):
 
         # total
 
-        total_loss = recon_loss + commit_loss
+        total_loss = recon_loss * self.recon_loss_weight + commit_loss * self.commit_loss_weight
 
-        loss_breakdown = (recon_loss, commit_loss)
-
-        return recon, indices, total_loss
+        return recon, indices, total_loss, (recon_loss, commit_loss)
 
 # class
 
 class ASAC(Module):
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        dim,
+        depth,
+        heads,
+        to_embedding,
+        seq_len = None,
+        dim_head = 64,
+        num_classes = 10,
+        use_asac = False,
+        dim_bottleneck = 256,
+        vq_codebook_size = 256,
+        recon_loss_weight = 1.,
+        commit_loss_weight = 1.
+    ):
         super().__init__()
 
+        self.depth = depth
+
+        self.to_embedding = to_embedding
+        self.pos_embedding = nn.Parameter(torch.randn(seq_len, dim)) if exists(seq_len) else None
+
+        self.layers = ModuleList([])
+
+        for _ in range(depth):
+            attn_schema = AttentionSchema(
+                dim = heads * (seq_len ** 2),
+                dim_bottleneck = dim_bottleneck,
+                codebook_size = vq_codebook_size,
+                recon_loss_weight = recon_loss_weight,
+                commit_loss_weight = commit_loss_weight
+            ) if use_asac and exists(seq_len) else None
+
+            self.layers.append(ModuleList([
+                Attention(dim, dim_head = dim_head, heads = heads, attn_schema = attn_schema),
+                FeedForward(dim)
+            ]))
+
+        self.to_logits = nn.Sequential(
+            nn.RMSNorm(dim),
+            Linear(dim, num_classes)
+        )
+
     def forward(self, x):
-        return x
+        x = self.to_embedding(x)
+
+        if exists(self.pos_embedding):
+            x = x + self.pos_embedding
+
+        total_aux_loss = 0.
+        total_recon_loss = 0.
+        total_commit_loss = 0.
+
+        for attn, ff in self.layers:
+            attn_out, indices, aux_loss, (recon_loss, commit_loss) = attn(x)
+
+            x = attn_out + x
+            x = ff(x) + x
+
+            total_aux_loss = total_aux_loss + aux_loss
+            total_recon_loss = total_recon_loss + recon_loss
+            total_commit_loss = total_commit_loss + commit_loss
+
+        x = reduce(x, 'b n d -> b d', 'mean')
+
+        logits = self.to_logits(x)
+
+        return ASACReturn(logits, total_aux_loss, (total_recon_loss / self.depth, total_commit_loss / self.depth))
