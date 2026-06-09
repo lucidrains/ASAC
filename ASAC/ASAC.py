@@ -16,7 +16,7 @@ from vector_quantize_pytorch import VectorQuantize
 
 from ema_pytorch import EMA
 
-from torch_einops_utils import pack_with_inverse
+from torch_einops_utils import pack_with_inverse, maybe
 
 # helpers
 
@@ -34,6 +34,7 @@ class Attention(Module):
         dim,
         dim_head = 64,
         heads = 8,
+        k_rmsnorm = True,
         attn_schema: Module | None = None,
         attn_add_residual = True # they had to add a residual for stability
     ):
@@ -43,6 +44,8 @@ class Attention(Module):
 
         self.to_qkv = Linear(dim, dim_inner * 3, bias = False)
         self.combine_heads = Linear(dim_inner, dim, bias = False)
+
+        self.k_rmsnorm = nn.RMSNorm(dim_head) if k_rmsnorm else None
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -60,6 +63,8 @@ class Attention(Module):
 
         q, k, v = self.to_qkv(tokens).chunk(3, dim = -1)
         q, k, v = (self.split_heads(t) for t in (q, k, v))
+
+        k = maybe(self.k_rmsnorm)(k)
 
         q = q * self.scale
 
