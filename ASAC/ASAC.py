@@ -101,6 +101,8 @@ class AttentionSchema(Module):
         self,
         dim,
         dim_bottleneck,
+        kl_div_loss = True,
+        detach_target = True,
         **vq_kwargs
     ):
         super().__init__()
@@ -109,6 +111,9 @@ class AttentionSchema(Module):
         self.vq = VectorQuantize(dim_bottleneck, **vq_kwargs)
 
         self.decoder = MLP(dim_bottleneck, dim, activation = nn.LeakyReLU())
+
+        self.kl_div_loss = kl_div_loss
+        self.detach_target = detach_target
 
     def forward(
         self,
@@ -127,10 +132,26 @@ class AttentionSchema(Module):
 
         recon = inverse_pack(decoded)
 
+        # loss, mse as in paper or reverse kl
+
         if return_loss:
-            recon_loss = F.mse_loss(attn_sim, recon)
+            if self.detach_target:
+                attn_sim = attn_sim.detach()
+
+            if self.kl_div_loss:
+                recon_loss = F.kl_div(
+                    attn_sim.log_softmax(dim = -1),
+                    recon,
+                    reduction = 'batchmean'
+                )
+            else:
+                recon_loss = F.mse_loss(recon, attn_sim)
+
+        # total
 
         total_loss = recon_loss + commit_loss
+
+        loss_breakdown = (recon_loss, commit_loss)
 
         return recon, indices, total_loss
 
