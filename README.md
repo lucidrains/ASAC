@@ -1,4 +1,4 @@
-# ASAC (wip)
+## ASAC (wip)
 
 Implementation of [Attention Schema-based Attention Control (ASAC)](https://arxiv.org/abs/2509.16058v1), A Cognitive-Inspired Approach for Attention Management in Transformers
 
