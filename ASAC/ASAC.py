@@ -58,6 +58,8 @@ class Attention(Module):
     def forward(
         self,
         tokens, # (b h w d)
+        pre_softmax_attn_gates = None,
+        post_softmax_attn_gates = None
     ):
         tokens, inverse_pack = pack_with_inverse(tokens, 'b * d')
 
@@ -82,9 +84,19 @@ class Attention(Module):
         if self.attn_add_residual:
             sim = sim + orig_sim
 
+        # modulate
+
+        if exists(pre_softmax_attn_gates):
+            sim = sim + pre_softmax_attn_gates
+
         # attend
 
         attn = sim.softmax(dim = -1)
+
+        # modulate
+
+        if exists(post_softmax_attn_gates):
+            attn = attn * post_softmax_attn_gates
 
         # aggregate and combine out
 
