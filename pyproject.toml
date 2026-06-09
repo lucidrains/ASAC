@@ -29,7 +29,9 @@ dependencies = [
     "ema-pytorch",
     "torch>=2.5",
     "torch-einops-utils>=0.1.2",
-    "vector-quantize-pytorch"
+    "vector-quantize-pytorch",
+    "x-transformers",
+    "x-mlps-pytorch"
 ]
 
 [project.urls]
