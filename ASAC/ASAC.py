@@ -117,7 +117,7 @@ class Attention(Module):
             sim, indices, aux_loss, aux_loss_breakdown = self.attn_schema(orig_sim)
 
         if self.attn_add_residual:
-            sim = sim + orig_sim
+            sim = (sim + orig_sim) * 0.5
 
         # modulate
 
@@ -153,7 +153,7 @@ class AttentionSchema(Module):
         self,
         dim,
         dim_bottleneck,
-        kl_div_loss = True,
+        kl_div_loss = False,
         detach_target = True,
         encoder: Module | None = None,
         decoder: Module | None = None,
@@ -181,6 +181,8 @@ class AttentionSchema(Module):
         self.recon_loss_weight = recon_loss_weight
         self.commit_loss_weight = commit_loss_weight
 
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
     def forward(
         self,
         attn_sim,
@@ -200,6 +202,8 @@ class AttentionSchema(Module):
 
         # loss, mse as in paper or reverse kl
 
+        recon_loss = self.zero
+
         if return_loss:
             if self.detach_target:
                 attn_sim = attn_sim.detach()
@@ -208,8 +212,8 @@ class AttentionSchema(Module):
                 recon_loss = F.kl_div(
                     attn_sim.log_softmax(dim = -1),
                     recon.softmax(dim = -1),
-                    reduction = 'batchmean'
-                )
+                    reduction = 'none'
+                ).sum(dim = -1).mean()
             else:
                 recon_loss = F.mse_loss(recon, attn_sim)
 
@@ -236,7 +240,8 @@ class ASAC(Module):
         dim_bottleneck = 256,
         vq_codebook_size = 256,
         recon_loss_weight = 1.,
-        commit_loss_weight = 1.
+        commit_loss_weight = 1.,
+        kl_div_loss = False
     ):
         super().__init__()
 
@@ -253,7 +258,8 @@ class ASAC(Module):
                 dim_bottleneck = dim_bottleneck,
                 codebook_size = vq_codebook_size,
                 recon_loss_weight = recon_loss_weight,
-                commit_loss_weight = commit_loss_weight
+                commit_loss_weight = commit_loss_weight,
+                kl_div_loss = kl_div_loss
             ) if use_asac and exists(seq_len) else None
 
             self.layers.append(ModuleList([
@@ -272,9 +278,7 @@ class ASAC(Module):
         if exists(self.pos_embedding):
             x = x + self.pos_embedding
 
-        total_aux_loss = 0.
-        total_recon_loss = 0.
-        total_commit_loss = 0.
+        total_aux_loss = total_recon_loss = total_commit_loss = 0.
 
         for attn, ff in self.layers:
             attn_out, indices, aux_loss, (recon_loss, commit_loss) = attn(x)

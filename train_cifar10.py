@@ -29,7 +29,7 @@ from accelerate import Accelerator
 from tqdm import tqdm
 import wandb
 
-from ASAC.ASAC import ASAC, PatchEmbedding
+from ASAC import ASAC, PatchEmbedding
 
 # train
 
@@ -43,11 +43,13 @@ def main(
     depth: int = 6,
     heads: int = 8,
     recon_loss_weight: float = 1.,
-    commit_loss_weight: float = 1.
+    commit_loss_weight: float = 1.,
+    kl_div_loss: bool = False,
+    project_name: str = 'ASAC'
 ):
     accelerator = Accelerator(cpu = cpu, log_with = 'wandb')
 
-    accelerator.init_trackers(project_name = 'ASAC', init_kwargs = {"wandb": {"name": f"cifar10-{'asac' if use_asac else 'baseline'}"}})
+    accelerator.init_trackers(project_name = project_name, init_kwargs = {"wandb": {"name": f"cifar10-{'asac' if use_asac else 'baseline'}"}})
 
     transform = T.Compose([
         T.RandomCrop(32, padding = 4),
@@ -74,7 +76,8 @@ def main(
         to_embedding = to_embedding,
         use_asac = use_asac,
         recon_loss_weight = recon_loss_weight,
-        commit_loss_weight = commit_loss_weight
+        commit_loss_weight = commit_loss_weight,
+        kl_div_loss = kl_div_loss
     )
 
     optimizer = optim.AdamW(model.parameters(), lr = lr, weight_decay = 1e-2)
