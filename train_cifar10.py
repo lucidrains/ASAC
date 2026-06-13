@@ -29,12 +29,15 @@ from accelerate import Accelerator
 from tqdm import tqdm
 import wandb
 
-from ASAC import ASAC, PatchEmbedding
+from ASAC import ASAC, PatchEmbedding, EMA_ASAC
 
 # train
 
 def main(
     use_asac: bool = False,
+    use_ema_targets: bool = False,
+    ema_decay: float = 0.999,
+    eval_use_base: bool = False,
     cpu: bool = False,
     epochs: int = 50,
     batch_size: int = 128,
@@ -87,6 +90,9 @@ def main(
         kl_div_loss = kl_div_loss
     )
 
+    if use_ema_targets:
+        model = EMA_ASAC(model, ema_decay = ema_decay)
+
     optimizer = optim.AdamW(model.parameters(), lr = lr, weight_decay = 1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
 
@@ -100,11 +106,15 @@ def main(
 
         for inputs, targets in pbar:
             optimizer.zero_grad()
-            outputs, aux_loss, (recon_loss, commit_loss) = model(inputs)
+            ret = model(inputs)
+            outputs, aux_loss, (recon_loss, commit_loss) = ret.logits, ret.aux_loss, ret.aux_loss_breakdown
 
             loss = F.cross_entropy(outputs, targets)
             accelerator.backward(loss + aux_loss)
             optimizer.step()
+            
+            if use_ema_targets:
+                accelerator.unwrap_model(model).update()
 
             acc = (outputs.argmax(dim = -1) == targets).float().mean()
 
@@ -123,7 +133,13 @@ def main(
             for inputs, targets in testloader:
                 batch = targets.shape[0]
 
-                outputs, _, _ = model(inputs)
+                if use_ema_targets:
+                    ret = model(inputs, use_ema = not eval_use_base)
+                else:
+                    ret = model(inputs)
+
+                outputs = ret.logits
+                
                 test_loss += F.cross_entropy(outputs, targets).item() * batch
                 test_acc += (outputs.argmax(dim = -1) == targets).float().sum().item()
                 total += batch

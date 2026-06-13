@@ -1,1 +1,1 @@
-from ASAC.ASAC import ASAC, PatchEmbedding
+from ASAC.ASAC import ASAC, PatchEmbedding, EMA_ASAC

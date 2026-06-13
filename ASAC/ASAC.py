@@ -29,8 +29,8 @@ def default(v, d):
 
 # return types
 
-AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown'])
-ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown'])
+AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'dot_sim'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'dot_sims'])
 
 # feedforward
 
@@ -90,7 +90,8 @@ class Attention(Module):
         self,
         tokens, # (b h w d)
         pre_softmax_attn_gates = None,
-        post_softmax_attn_gates = None
+        post_softmax_attn_gates = None,
+        attn_schema_target = None
     ):
         tokens = self.norm(tokens)
 
@@ -114,7 +115,7 @@ class Attention(Module):
         indices = None
 
         if exists(self.attn_schema):
-            sim, indices, aux_loss, aux_loss_breakdown = self.attn_schema(orig_sim)
+            sim, indices, aux_loss, aux_loss_breakdown = self.attn_schema(orig_sim, target_sim = attn_schema_target)
 
         if self.attn_add_residual:
             sim = (sim + orig_sim) * 0.5
@@ -144,7 +145,7 @@ class Attention(Module):
 
         attended = inverse_pack(attended)
 
-        return AttentionReturn(attended, indices, aux_loss, aux_loss_breakdown)
+        return AttentionReturn(attended, indices, aux_loss, aux_loss_breakdown, orig_sim)
 
 # attention autoencoder
 
@@ -186,7 +187,8 @@ class AttentionSchema(Module):
     def forward(
         self,
         attn_sim,
-        return_loss = None
+        return_loss = None,
+        target_sim = None
     ):
         return_loss = default(return_loss, self.training)
 
@@ -204,18 +206,20 @@ class AttentionSchema(Module):
 
         recon_loss = self.zero
 
+        target = default(target_sim, attn_sim)
+
         if return_loss:
             if self.detach_target:
-                attn_sim = attn_sim.detach()
+                target = target.detach()
 
             if self.kl_div_loss:
                 recon_loss = F.kl_div(
-                    attn_sim.log_softmax(dim = -1),
+                    target.log_softmax(dim = -1),
                     recon.softmax(dim = -1),
                     reduction = 'none'
                 ).sum(dim = -1).mean()
             else:
-                recon_loss = F.mse_loss(recon, attn_sim)
+                recon_loss = F.mse_loss(recon, target)
 
         # total
 
@@ -272,7 +276,7 @@ class ASAC(Module):
             Linear(dim, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x, attn_schema_targets = None):
         x = self.to_embedding(x)
 
         if exists(self.pos_embedding):
@@ -280,8 +284,13 @@ class ASAC(Module):
 
         total_aux_loss = total_recon_loss = total_commit_loss = 0.
 
-        for attn, ff in self.layers:
-            attn_out, indices, aux_loss, (recon_loss, commit_loss) = attn(x)
+        attn_schema_targets = default(attn_schema_targets, [None] * self.depth)
+        dot_sims = []
+
+        for (attn, ff), target in zip(self.layers, attn_schema_targets):
+            attn_out, indices, aux_loss, (recon_loss, commit_loss), dot_sim = attn(x, attn_schema_target = target)
+            
+            dot_sims.append(dot_sim)
 
             x = attn_out + x
             x = ff(x) + x
@@ -294,4 +303,29 @@ class ASAC(Module):
 
         logits = self.to_logits(x)
 
-        return ASACReturn(logits, total_aux_loss, (total_recon_loss / self.depth, total_commit_loss / self.depth))
+        return ASACReturn(logits, total_aux_loss, (total_recon_loss / self.depth, total_commit_loss / self.depth), dot_sims)
+
+class EMA_ASAC(Module):
+    def __init__(self, asac_model, ema_decay = 0.999, **ema_kwargs):
+        super().__init__()
+        self.asac = asac_model
+        self.ema_model = EMA(asac_model, beta = ema_decay, **ema_kwargs)
+
+    def forward(self, x, use_ema = False):
+        if use_ema:
+            return self.ema_model(x)
+
+        if not self.training:
+            return self.asac(x)
+
+        # get EMA targets
+        with torch.no_grad():
+            self.ema_model.eval()
+            ema_outputs = self.ema_model.ema_model(x)
+            ema_targets = [sim.detach() for sim in ema_outputs.dot_sims]
+            self.ema_model.train()
+
+        return self.asac(x, attn_schema_targets = ema_targets)
+
+    def update(self):
+        self.ema_model.update()
