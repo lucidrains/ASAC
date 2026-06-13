@@ -6,10 +6,10 @@ from torch import nn, tensor
 from torch.nn import Module, Linear, ModuleList
 import torch.nn.functional as F
 
-from einops import einsum, reduce
+from einops import einsum, reduce, rearrange
 from einops.layers.torch import Rearrange
 
-from x_transformers import Decoder
+from x_transformers import Decoder, AutoregressiveWrapper, TransformerWrapper
 
 from x_mlps_pytorch import MLP
 
@@ -29,8 +29,8 @@ def default(v, d):
 
 # return types
 
-AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'dot_sim'])
-ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'dot_sims'])
+AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss'])
 
 # feedforward
 
@@ -65,7 +65,8 @@ class Attention(Module):
         heads = 8,
         k_rmsnorm = True,
         attn_schema: Module | None = None,
-        attn_add_residual = True # they had to add a residual for stability
+        attn_add_residual = True, # they had to add a residual for stability
+        stochastic_sample_attn = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
@@ -83,6 +84,8 @@ class Attention(Module):
 
         self.attn_schema = attn_schema
         self.attn_add_residual = attn_add_residual and attn_schema
+
+        self.stochastic_sample_attn = stochastic_sample_attn
 
         self.register_buffer('zero', tensor(0.), persistent = False)
 
@@ -127,7 +130,10 @@ class Attention(Module):
 
         # attend
 
-        attn = sim.softmax(dim = -1)
+        if self.stochastic_sample_attn:
+            attn = F.gumbel_softmax(sim, tau = 1., hard = True, dim = -1)
+        else:
+            attn = sim.softmax(dim = -1)
 
         # modulate
 
@@ -145,7 +151,13 @@ class Attention(Module):
 
         attended = inverse_pack(attended)
 
-        return AttentionReturn(attended, indices, aux_loss, aux_loss_breakdown, orig_sim)
+        return AttentionReturn(
+            attended,
+            indices,
+            aux_loss,
+            aux_loss_breakdown,
+            orig_sim
+        )
 
 # attention autoencoder
 
@@ -245,9 +257,14 @@ class ASAC(Module):
         vq_codebook_size = 256,
         recon_loss_weight = 1.,
         commit_loss_weight = 1.,
-        kl_div_loss = True
+        kl_div_loss = True,
+        stochastic_sample_attn = False,
+        awareness_model_depth = 2,
+        **awareness_model_kwargs
     ):
         super().__init__()
+
+        assert depth >= 2, 'depth must be at least 2'
 
         self.depth = depth
 
@@ -267,9 +284,33 @@ class ASAC(Module):
             ) if use_asac and exists(seq_len) else None
 
             self.layers.append(ModuleList([
-                Attention(dim, dim_head = dim_head, heads = heads, attn_schema = attn_schema),
+                Attention(dim, dim_head = dim_head, heads = heads, attn_schema = attn_schema, stochastic_sample_attn = stochastic_sample_attn),
                 FeedForward(dim)
             ]))
+
+        # autoregressive awareness model (attention schema theory)
+
+        self.awareness_transformer = None
+        self.awareness_model = None
+
+        if use_asac and exists(seq_len):
+            self.awareness_transformer = TransformerWrapper(
+                num_tokens = vq_codebook_size,
+                max_seq_len = depth,
+                attn_layers = Decoder(
+                    dim = dim,
+                    depth = awareness_model_depth,
+                    heads = heads,
+                    rotary_pos_emb = True,
+                    **awareness_model_kwargs
+                )
+            )
+
+            self.awareness_model = AutoregressiveWrapper(self.awareness_transformer)
+
+        # zero buffer for auxiliary losses
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
 
         self.to_logits = nn.Sequential(
             nn.RMSNorm(dim),
@@ -285,12 +326,15 @@ class ASAC(Module):
         total_aux_loss = total_recon_loss = total_commit_loss = 0.
 
         attn_schema_targets = default(attn_schema_targets, [None] * self.depth)
-        dot_sims = []
+        attn_sims = []
+        attn_schema_indices = []
 
         for (attn, ff), target in zip(self.layers, attn_schema_targets):
-            attn_out, indices, aux_loss, (recon_loss, commit_loss), dot_sim = attn(x, attn_schema_target = target)
+            attn_out, indices, aux_loss, (recon_loss, commit_loss), attn_sim = attn(x, attn_schema_target = target)
 
-            dot_sims.append(dot_sim)
+            attn_sims.append(attn_sim)
+            if exists(indices):
+                attn_schema_indices.append(indices)
 
             x = attn_out + x
             x = ff(x) + x
@@ -303,13 +347,38 @@ class ASAC(Module):
 
         logits = self.to_logits(x)
 
-        return ASACReturn(logits, total_aux_loss, (total_recon_loss / self.depth, total_commit_loss / self.depth), dot_sims)
+        attn_schema_autoregressive_loss = self.zero
+
+        if attn_schema_indices:
+            attn_schema_indices = rearrange(attn_schema_indices, 'depth b ... -> b (depth ...)')
+
+            if exists(self.awareness_model):
+                attn_schema_autoregressive_loss = self.awareness_model(attn_schema_indices)
+        else:
+            attn_schema_indices = None
+
+        return ASACReturn(
+            logits,
+            total_aux_loss,
+            (total_recon_loss / self.depth, total_commit_loss / self.depth),
+            attn_sims,
+            attn_schema_indices,
+            attn_schema_autoregressive_loss
+        )
 
 class EMA_ASAC(Module):
-    def __init__(self, asac_model, ema_decay = 0.999, **ema_kwargs):
+    def __init__(
+        self,
+        asac_model,
+        ema_decay = 0.999,
+        **ema_kwargs
+    ):
         super().__init__()
         self.asac = asac_model
         self.ema_model = EMA(asac_model, beta = ema_decay, **ema_kwargs)
+
+    def update(self):
+        self.ema_model.update()
 
     def forward(self, x, use_ema = False):
         if use_ema:
@@ -321,11 +390,8 @@ class EMA_ASAC(Module):
         # get EMA targets
         with torch.no_grad():
             self.ema_model.eval()
-            ema_outputs = self.ema_model.ema_model(x)
-            ema_targets = [sim.detach() for sim in ema_outputs.dot_sims]
+            ema_outputs = self.ema_model(x)
+            ema_targets = [sim.detach() for sim in ema_outputs.attn_sims]
             self.ema_model.train()
 
         return self.asac(x, attn_schema_targets = ema_targets)
-
-    def update(self):
-        self.ema_model.update()
