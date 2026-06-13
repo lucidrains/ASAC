@@ -289,7 +289,7 @@ class ASAC(Module):
 
         for (attn, ff), target in zip(self.layers, attn_schema_targets):
             attn_out, indices, aux_loss, (recon_loss, commit_loss), dot_sim = attn(x, attn_schema_target = target)
-            
+
             dot_sims.append(dot_sim)
 
             x = attn_out + x

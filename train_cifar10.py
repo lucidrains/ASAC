@@ -112,7 +112,7 @@ def main(
             loss = F.cross_entropy(outputs, targets)
             accelerator.backward(loss + aux_loss)
             optimizer.step()
-            
+
             if use_ema_targets:
                 accelerator.unwrap_model(model).update()
 
@@ -139,7 +139,7 @@ def main(
                     ret = model(inputs)
 
                 outputs = ret.logits
-                
+
                 test_loss += F.cross_entropy(outputs, targets).item() * batch
                 test_acc += (outputs.argmax(dim = -1) == targets).float().sum().item()
                 total += batch
