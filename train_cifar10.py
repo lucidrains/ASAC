@@ -44,12 +44,19 @@ def main(
     heads: int = 8,
     recon_loss_weight: float = 1.,
     commit_loss_weight: float = 1.,
-    kl_div_loss: bool = False,
-    project_name: str = 'ASAC'
+    kl_div_loss: bool = True,
+    project_name: str = 'asac-kl-div'
 ):
     accelerator = Accelerator(cpu = cpu, log_with = 'wandb')
 
-    accelerator.init_trackers(project_name = project_name, init_kwargs = {"wandb": {"name": f"cifar10-{'asac' if use_asac else 'baseline'}"}})
+    run_name = 'asac' if use_asac else 'baseline'
+    if use_asac and kl_div_loss:
+        run_name += '-kldiv'
+
+    accelerator.init_trackers(
+        project_name = project_name,
+        init_kwargs = dict(wandb = dict(name = f'cifar10-{run_name}'))
+    )
 
     transform = T.Compose([
         T.RandomCrop(32, padding = 4),

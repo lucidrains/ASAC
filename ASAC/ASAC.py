@@ -153,7 +153,7 @@ class AttentionSchema(Module):
         self,
         dim,
         dim_bottleneck,
-        kl_div_loss = False,
+        kl_div_loss = True,
         detach_target = True,
         encoder: Module | None = None,
         decoder: Module | None = None,
@@ -164,14 +164,14 @@ class AttentionSchema(Module):
         super().__init__()
 
         if not exists(encoder):
-            encoder = MLP(dim, dim_bottleneck, activation = nn.LeakyReLU())
+            encoder = MLP(dim, dim_bottleneck, dim_bottleneck, activation = nn.LeakyReLU())
 
         self.encoder = encoder
 
         self.vq = VectorQuantize(dim_bottleneck, **vq_kwargs)
 
         if not exists(decoder):
-            decoder = MLP(dim_bottleneck, dim, activation = nn.LeakyReLU())
+            decoder = MLP(dim_bottleneck, dim_bottleneck, dim, activation = nn.LeakyReLU())
 
         self.decoder = decoder
 
@@ -241,7 +241,7 @@ class ASAC(Module):
         vq_codebook_size = 256,
         recon_loss_weight = 1.,
         commit_loss_weight = 1.,
-        kl_div_loss = False
+        kl_div_loss = True
     ):
         super().__init__()
 
