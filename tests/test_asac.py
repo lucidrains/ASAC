@@ -57,11 +57,12 @@ def test_ema_asac():
     ema_ret = ema_asac(data, use_ema = True)
     assert ema_ret.logits.shape == ret.logits.shape
 
-def test_autoregressive_schema_loss():
+@pytest.mark.parametrize('use_awareness', [True, False])
+def test_autoregressive_schema_loss(use_awareness):
     from ASAC.ASAC import ASAC, PatchEmbedding
-    
+
     to_embedding = PatchEmbedding(dim = 32, patch_size = 4, channels = 3)
-    
+
     model = ASAC(
         dim = 32,
         depth = 64,
@@ -76,12 +77,12 @@ def test_autoregressive_schema_loss():
     )
 
     data = torch.randn(2, 3, 16, 16)
-    ret = model(data)
-    
+    ret = model(data, use_awareness = use_awareness)
+
     assert ret.logits.shape == (2, 10)
     assert ret.attn_schema_indices.shape == (2, 64)
     assert ret.attn_schema_autoregressive_loss.ndim == 0
-    
+
     import torch.nn.functional as F
     labels = torch.randint(0, 10, (2,))
     loss = F.cross_entropy(ret.logits, labels) + ret.attn_schema_autoregressive_loss

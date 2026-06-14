@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from einops import einsum, reduce, rearrange
 from einops.layers.torch import Rearrange
+import einx
 
 from x_transformers import Decoder, AutoregressiveWrapper, TransformerWrapper
 
@@ -26,6 +27,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def is_empty(t):
+    return len(t) == 0
 
 # return types
 
@@ -259,6 +263,7 @@ class ASAC(Module):
         commit_loss_weight = 1.,
         kl_div_loss = True,
         stochastic_sample_attn = False,
+        awareness_dropout_prob = 0.,
         awareness_model_depth = 2,
         **awareness_model_kwargs
     ):
@@ -267,6 +272,9 @@ class ASAC(Module):
         assert depth >= 2, 'depth must be at least 2'
 
         self.depth = depth
+
+        self.awareness_dropout_prob = awareness_dropout_prob
+        self.has_awareness_dropout = awareness_dropout_prob > 0.
 
         self.to_embedding = to_embedding
         self.pos_embedding = nn.Parameter(torch.randn(seq_len, dim)) if exists(seq_len) else None
@@ -307,6 +315,7 @@ class ASAC(Module):
             )
 
             self.awareness_model = AutoregressiveWrapper(self.awareness_transformer)
+            self.awareness_to_logits = MLP(dim, dim, num_classes, activation = nn.LeakyReLU())
 
         # zero buffer for auxiliary losses
 
@@ -317,7 +326,9 @@ class ASAC(Module):
             Linear(dim, num_classes)
         )
 
-    def forward(self, x, attn_schema_targets = None):
+    def forward(self, x, attn_schema_targets = None, use_awareness = True):
+        batch = x.shape[0]
+
         x = self.to_embedding(x)
 
         if exists(self.pos_embedding):
@@ -349,13 +360,26 @@ class ASAC(Module):
 
         attn_schema_autoregressive_loss = self.zero
 
-        if attn_schema_indices:
-            attn_schema_indices = rearrange(attn_schema_indices, 'depth b ... -> b (depth ...)')
+        _attn_schema_indices = attn_schema_indices
+        attn_schema_indices = None
+
+        if not is_empty(_attn_schema_indices):
+            attn_schema_indices = rearrange(_attn_schema_indices, 'depth b ... -> b (depth ...)')
 
             if exists(self.awareness_model):
                 attn_schema_autoregressive_loss = self.awareness_model(attn_schema_indices)
-        else:
-            attn_schema_indices = None
+
+                if use_awareness:
+                    _, embeddings = self.awareness_transformer(attn_schema_indices, return_logits_and_embeddings = True)
+                    last_embedding = embeddings[:, -1, :]
+
+                    awareness_logits = self.awareness_to_logits(last_embedding)
+
+                    if self.training and self.has_awareness_dropout:
+                        drop_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
+                        awareness_logits = einx.where('b, , b d -> b d', drop_awareness, 0., awareness_logits)
+
+                    logits = logits + awareness_logits
 
         return ASACReturn(
             logits,
@@ -369,29 +393,32 @@ class ASAC(Module):
 class EMA_ASAC(Module):
     def __init__(
         self,
-        asac_model,
+        asac,
         ema_decay = 0.999,
         **ema_kwargs
     ):
         super().__init__()
-        self.asac = asac_model
-        self.ema_model = EMA(asac_model, beta = ema_decay, **ema_kwargs)
+        self.asac = asac
+
+        self.ema_model = EMA(asac, beta = ema_decay, **ema_kwargs)
 
     def update(self):
         self.ema_model.update()
 
-    def forward(self, x, use_ema = False):
-        if use_ema:
-            return self.ema_model(x)
+    def forward(
+        self,
+        *args,
+        use_ema = False,
+        **kwargs
+    ):
+        if not self.training or use_ema:
+            return self.ema_model(*args, **kwargs)
 
-        if not self.training:
-            return self.asac(x)
-
-        # get EMA targets
         with torch.no_grad():
             self.ema_model.eval()
-            ema_outputs = self.ema_model(x)
+            ema_outputs = self.ema_model(*args, **kwargs)
             ema_targets = [sim.detach() for sim in ema_outputs.attn_sims]
             self.ema_model.train()
 
-        return self.asac(x, attn_schema_targets = ema_targets)
+        kwargs.update(attn_schema_targets = ema_targets)
+        return self.asac(*args, **kwargs)
