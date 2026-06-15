@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 from collections import namedtuple
+
 import torch
+import torch.nn.functional as F
 from torch import nn, tensor
 from torch.nn import Module, Linear, ModuleList
-import torch.nn.functional as F
 
 from einops import einsum, reduce, rearrange
 from einops.layers.torch import Rearrange
 import einx
 
-from x_transformers import Decoder, AutoregressiveWrapper, TransformerWrapper
-
 from x_mlps_pytorch import MLP
-
 from vector_quantize_pytorch import VectorQuantize
 
 from ema_pytorch import EMA
-
-from torch_einops_utils import pack_with_inverse, maybe
+from torch_einops_utils import pack_with_inverse, maybe, tree_map_tensor
 
 # helpers
 
@@ -31,12 +28,11 @@ def default(v, d):
 def is_empty(t):
     return len(t) == 0
 
-
-
 # return types
 
-AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim'])
-ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss'])
+AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim', 'cache'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims'])
+AuxLossBreakdown = namedtuple('AuxLossBreakdown', ['recon_loss', 'commit_loss'])
 
 # feedforward
 
@@ -44,9 +40,9 @@ def FeedForward(dim, expansion_factor = 4.):
     dim_inner = int(dim * expansion_factor)
     return nn.Sequential(
         nn.RMSNorm(dim),
-        nn.Linear(dim, dim_inner),
+        Linear(dim, dim_inner),
         nn.GELU(),
-        nn.Linear(dim_inner, dim)
+        Linear(dim_inner, dim)
     )
 
 # embedding
@@ -71,12 +67,15 @@ class Attention(Module):
         heads = 8,
         k_rmsnorm = True,
         attn_schema: Module | None = None,
-        attn_add_residual = True, # they had to add a residual for stability
-        stochastic_sample_attn = False
+        attn_add_residual = True,
+        stochastic_sample_attn = False,
+        causal = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
+
+        self.causal = causal
 
         self.norm = nn.RMSNorm(dim)
 
@@ -97,10 +96,11 @@ class Attention(Module):
 
     def forward(
         self,
-        tokens, # (b h w d)
+        tokens, # (b h w d) or (b n d)
         pre_softmax_attn_gates = None,
         post_softmax_attn_gates = None,
-        attn_schema_target = None
+        attn_schema_target = None,
+        cache = None
     ):
         tokens = self.norm(tokens)
 
@@ -111,7 +111,18 @@ class Attention(Module):
 
         k = maybe(self.k_rmsnorm)(k)
 
+        # kv caching
+
+        if exists(cache):
+            past_k, past_v = cache
+            k = torch.cat((past_k, k), dim = -2)
+            v = torch.cat((past_v, v), dim = -2)
+
+        new_cache = (k, v)
+
         q = q * self.scale
+
+        # similarity
 
         sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
 
@@ -120,7 +131,7 @@ class Attention(Module):
         # the proposal
 
         aux_loss = self.zero
-        aux_loss_breakdown = (self.zero, self.zero)
+        aux_loss_breakdown = AuxLossBreakdown(self.zero, self.zero)
         indices = None
 
         if exists(self.attn_schema):
@@ -133,6 +144,13 @@ class Attention(Module):
 
         if exists(pre_softmax_attn_gates):
             sim = sim + pre_softmax_attn_gates
+
+        # causal masking
+
+        if self.causal:
+            i, j = sim.shape[-2:]
+            causal_mask = torch.ones((i, j), device = sim.device, dtype = torch.bool).triu(j - i + 1)
+            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         # attend
 
@@ -162,7 +180,8 @@ class Attention(Module):
             indices,
             aux_loss,
             aux_loss_breakdown,
-            orig_sim
+            orig_sim,
+            new_cache
         )
 
 # attention autoencoder
@@ -215,12 +234,9 @@ class AttentionSchema(Module):
 
         target = default(target_sim, attn_sim)
 
-        # handle causal mask
-        # zero out upper right for autoencoding
-
         if self.causal:
-            n = attn_sim.shape[-1]
-            mask = attn_sim.new_ones(n, n, dtype = torch.bool).triu(1)
+            i, j = attn_sim.shape[-2:]
+            mask = torch.ones((i, j), device = attn_sim.device, dtype = torch.bool).triu(j - i + 1)
             attn_sim = attn_sim.masked_fill(mask, 0.)
 
         attn_features, inverse_pack = pack_with_inverse(attn_sim, 'b *')
@@ -231,29 +247,28 @@ class AttentionSchema(Module):
 
         recon = inverse_pack(self.decoder(quantized))
 
-        # mask to -inf if causal
-
         if self.causal:
-            mask_value = -torch.finfo(attn_sim.dtype).max
-            recon = recon.masked_fill(mask, mask_value)
+            recon = recon.masked_fill(mask, 0.)
 
         # early return if no loss
 
         if not return_loss:
             total_loss = commit_loss * self.commit_loss_weight
-            return recon, indices, total_loss, (self.zero, commit_loss)
+            return recon, indices, total_loss, AuxLossBreakdown(self.zero, commit_loss)
 
         # loss, mse as in paper or reverse kl
 
+        mask_value = -torch.finfo(attn_sim.dtype).max
+
         target = target.detach() if self.detach_target else target
         target = target.masked_fill(mask, mask_value) if self.causal else target
+        recon_for_loss = recon.masked_fill(mask, mask_value) if self.causal else recon
 
         if self.kl_div_loss:
             # kl div
-
             loss = F.kl_div(
                 target.log_softmax(dim = -1),
-                recon.softmax(dim = -1),
+                recon_for_loss.softmax(dim = -1),
                 reduction = 'none'
             )
 
@@ -261,8 +276,7 @@ class AttentionSchema(Module):
             recon_loss = loss.sum(dim = -1).mean()
         else:
             # mse
-
-            loss = F.mse_loss(recon, target, reduction = 'none')
+            loss = F.mse_loss(recon_for_loss, target, reduction = 'none')
 
             if self.causal:
                 valid_fraction = (~mask).float().mean()
@@ -270,11 +284,74 @@ class AttentionSchema(Module):
             else:
                 recon_loss = loss.mean()
 
-        # total
-
         total_loss = recon_loss * self.recon_loss_weight + commit_loss * self.commit_loss_weight
 
-        return recon, indices, total_loss, (recon_loss, commit_loss)
+        return recon, indices, total_loss, AuxLossBreakdown(recon_loss, commit_loss)
+
+# autoregressive awareness model
+
+class AutoregressiveAwareness(Module):
+    def __init__(
+        self,
+        dim,
+        depth,
+        heads,
+        num_tokens,
+        max_seq_len,
+        dim_head = 64,
+        attn_schema: Module | None = None,
+        stochastic_sample_attn = False
+    ):
+        super().__init__()
+        self.token_emb = nn.Embedding(num_tokens, dim)
+        self.pos_emb = nn.Embedding(max_seq_len, dim)
+
+        self.layers = ModuleList([])
+
+        for _ in range(depth):
+            self.layers.append(ModuleList([
+                Attention(
+                    dim = dim,
+                    dim_head = dim_head,
+                    heads = heads,
+                    causal = True,
+                    attn_schema = attn_schema,
+                    stochastic_sample_attn = stochastic_sample_attn
+                ),
+                FeedForward(dim)
+            ]))
+
+        self.norm = nn.RMSNorm(dim)
+        self.to_logits = Linear(dim, num_tokens)
+
+    def forward(
+        self,
+        x,
+        attn_schema_targets = None
+    ):
+        n = x.shape[-1]
+
+        x = self.token_emb(x)
+        x = x + self.pos_emb(torch.arange(n, device = x.device))
+
+        total_aux_loss = 0.
+        attn_sims = []
+
+        attn_schema_targets = default(attn_schema_targets, [None] * len(self.layers))
+
+        for (attn, ff), target_sim in zip(self.layers, attn_schema_targets):
+            attn_out = attn(x, attn_schema_target = target_sim)
+
+            x = attn_out.attended + x
+            x = ff(x) + x
+
+            total_aux_loss = total_aux_loss + attn_out.aux_loss
+            attn_sims.append(attn_out.attn_sim)
+
+        embeds = self.norm(x)
+        logits = self.to_logits(embeds)
+
+        return logits, embeds, attn_sims, total_aux_loss
 
 # class
 
@@ -297,8 +374,7 @@ class ASAC(Module):
         kl_div_loss = True,
         stochastic_sample_attn = False,
         awareness_dropout_prob = 0.,
-        awareness_model_depth = 2,
-        **awareness_model_kwargs
+        awareness_model_depth = 2
     ):
         super().__init__()
 
@@ -331,35 +407,48 @@ class ASAC(Module):
 
         # autoregressive awareness model (attention schema theory)
 
-        self.awareness_transformer = None
         self.awareness_model = None
 
         if use_asac and exists(seq_len):
-            self.awareness_transformer = TransformerWrapper(
-                num_tokens = vq_codebook_size,
-                max_seq_len = depth,
-                attn_layers = Decoder(
-                    dim = dim,
-                    depth = awareness_model_depth,
-                    heads = heads,
-                    rotary_pos_emb = True,
-                    **awareness_model_kwargs
-                )
+            awareness_attn_schema = AttentionSchema(
+                dim = heads * (depth ** 2),
+                dim_bottleneck = dim_bottleneck,
+                codebook_size = vq_codebook_size,
+                recon_loss_weight = recon_loss_weight,
+                commit_loss_weight = commit_loss_weight,
+                kl_div_loss = kl_div_loss,
+                causal = True
             )
 
-            self.awareness_model = AutoregressiveWrapper(self.awareness_transformer)
+            self.awareness_model = AutoregressiveAwareness(
+                dim = dim,
+                depth = awareness_model_depth,
+                heads = heads,
+                dim_head = dim_head,
+                num_tokens = vq_codebook_size,
+                max_seq_len = depth,
+                attn_schema = awareness_attn_schema,
+                stochastic_sample_attn = stochastic_sample_attn
+            )
+
             self.awareness_to_logits = MLP(dim, dim, num_classes, activation = nn.LeakyReLU())
-
-        # zero buffer for auxiliary losses
-
-        self.register_buffer('zero', tensor(0.), persistent = False)
 
         self.to_logits = nn.Sequential(
             nn.RMSNorm(dim),
             Linear(dim, num_classes)
         )
 
-    def forward(self, x, attn_schema_targets = None, use_awareness = True):
+        # zero buffer for auxiliary losses
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def forward(
+        self,
+        x,
+        attn_schema_targets = None,
+        awareness_attn_schema_targets = None,
+        use_awareness = True
+    ):
         batch = x.shape[0]
 
         x = self.to_embedding(x)
@@ -374,54 +463,73 @@ class ASAC(Module):
         attn_schema_indices = []
 
         for (attn, ff), target in zip(self.layers, attn_schema_targets):
-            attn_out, indices, aux_loss, (recon_loss, commit_loss), attn_sim = attn(x, attn_schema_target = target)
+            attn_out = attn(x, attn_schema_target = target)
 
-            attn_sims.append(attn_sim)
-            if exists(indices):
-                attn_schema_indices.append(indices)
+            attn_sims.append(attn_out.attn_sim)
 
-            x = attn_out + x
+            if exists(attn_out.indices):
+                attn_schema_indices.append(attn_out.indices)
+
+            x = attn_out.attended + x
             x = ff(x) + x
 
-            total_aux_loss = total_aux_loss + aux_loss
-            total_recon_loss = total_recon_loss + recon_loss
-            total_commit_loss = total_commit_loss + commit_loss
+            total_aux_loss = total_aux_loss + attn_out.aux_loss
+            total_recon_loss = total_recon_loss + attn_out.aux_loss_breakdown.recon_loss
+            total_commit_loss = total_commit_loss + attn_out.aux_loss_breakdown.commit_loss
 
         x = reduce(x, 'b n d -> b d', 'mean')
 
         logits = self.to_logits(x)
 
         attn_schema_autoregressive_loss = self.zero
+        awareness_attn_sims = None
 
-        _attn_schema_indices = attn_schema_indices
-        attn_schema_indices = None
+        # handle schema indices
 
-        if not is_empty(_attn_schema_indices):
-            attn_schema_indices = rearrange(_attn_schema_indices, 'depth b ... -> b (depth ...)')
+        attn_schema_indices = None if is_empty(attn_schema_indices) else attn_schema_indices
+        attn_schema_indices = maybe(rearrange)(attn_schema_indices, 'depth b ... -> b (depth ...)')
 
-            if exists(self.awareness_model):
-                attn_schema_autoregressive_loss = self.awareness_model(attn_schema_indices)
+        # awareness model
 
-                if use_awareness:
-                    _, embeddings = self.awareness_transformer(attn_schema_indices, return_logits_and_embeddings = True)
-                    last_embedding = embeddings[:, -1, :]
+        if exists(self.awareness_model) and exists(attn_schema_indices):
+            awareness_logits, awareness_embeddings, awareness_attn_sims, awareness_aux_loss = self.awareness_model(
+                attn_schema_indices,
+                attn_schema_targets = awareness_attn_schema_targets
+            )
 
-                    awareness_logits = self.awareness_to_logits(last_embedding)
+            # autoregressive loss on schema indices
 
-                    if self.training and self.has_awareness_dropout:
-                        drop_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
-                        awareness_logits = einx.where('b, , b d -> b d', drop_awareness, 0., awareness_logits)
+            seq_logits = awareness_logits[:, :-1]
+            target = attn_schema_indices[:, 1:]
+            ce_loss = F.cross_entropy(rearrange(seq_logits, 'b n c -> b c n'), target)
+            attn_schema_autoregressive_loss = ce_loss + awareness_aux_loss
 
-                    logits = logits + awareness_logits
+            # awareness modulation, that's the evolutionary argument for this theory
+
+            if use_awareness:
+                last_embedding = awareness_embeddings[:, -1, :]
+
+                awareness_logits = self.awareness_to_logits(last_embedding)
+
+                # awareness dropout
+
+                if self.training and self.has_awareness_dropout:
+                    drop_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
+                    awareness_logits = einx.where('b, , b d -> b d', drop_awareness, 0., awareness_logits)
+
+                logits = logits + awareness_logits
 
         return ASACReturn(
             logits,
             total_aux_loss,
-            (total_recon_loss / self.depth, total_commit_loss / self.depth),
+            AuxLossBreakdown(total_recon_loss / self.depth, total_commit_loss / self.depth),
             attn_sims,
             attn_schema_indices,
-            attn_schema_autoregressive_loss
+            attn_schema_autoregressive_loss,
+            awareness_attn_sims
         )
+
+# ema class
 
 class EMA_ASAC(Module):
     def __init__(
@@ -450,8 +558,14 @@ class EMA_ASAC(Module):
         with torch.no_grad():
             self.ema_model.eval()
             ema_outputs = self.ema_model(*args, **kwargs)
-            ema_targets = [sim.detach() for sim in ema_outputs.attn_sims]
+
+            ema_targets, ema_awareness_targets = tree_map_tensor(lambda t: t.detach(), (ema_outputs.attn_sims, ema_outputs.awareness_attn_sims))
+
             self.ema_model.train()
 
-        kwargs.update(attn_schema_targets = ema_targets)
-        return self.asac(*args, **kwargs)
+        return self.asac(
+            *args,
+            attn_schema_targets = ema_targets,
+            awareness_attn_schema_targets = ema_awareness_targets,
+            **kwargs
+        )
