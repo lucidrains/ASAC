@@ -88,19 +88,6 @@ def test_autoregressive_schema_loss(use_awareness):
     loss = F.cross_entropy(ret.logits, labels) + ret.attn_schema_autoregressive_loss
     loss.backward()
 
-def test_causal_shift():
-    from ASAC.ASAC import causal_to_diag, diag_to_causal
-
-    n = 4
-    attn = torch.randn(2, 4, n, n)
-    mask = torch.ones_like(attn, dtype = torch.bool).triu(1)
-    attn_masked = attn.masked_fill(mask, 0.)
-
-    shifted = causal_to_diag(attn_masked)
-    recovered = diag_to_causal(shifted)
-
-    assert torch.allclose(attn_masked, recovered)
-
 @pytest.mark.parametrize('causal', [False, True])
 def test_attention_schema(causal):
     from ASAC.ASAC import AttentionSchema

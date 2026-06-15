@@ -18,7 +18,7 @@ from vector_quantize_pytorch import VectorQuantize
 
 from ema_pytorch import EMA
 
-from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim
+from torch_einops_utils import pack_with_inverse, maybe
 
 # helpers
 
@@ -31,19 +31,7 @@ def default(v, d):
 def is_empty(t):
     return len(t) == 0
 
-# causal attention schema trick
 
-def causal_to_diag(x):
-    *b_and_h, n, _ = x.shape
-    x = pad_left_at_dim(x, 1, dim = -2)
-    x = x.reshape(*b_and_h, n, n + 1)
-    return x[..., 1:]
-
-def diag_to_causal(x):
-    *b_and_h, n, _ = x.shape
-    x = pad_left_at_dim(x, 1, dim = -1)
-    x = x.reshape(*b_and_h, n + 1, n)
-    return x[..., 1:, :]
 
 # return types
 
@@ -228,12 +216,12 @@ class AttentionSchema(Module):
         target = default(target_sim, attn_sim)
 
         # handle causal mask
-        # zero out upper right, then shift lower left to upper right for autoencoding
+        # zero out upper right for autoencoding
 
         if self.causal:
             n = attn_sim.shape[-1]
             mask = attn_sim.new_ones(n, n, dtype = torch.bool).triu(1)
-            attn_sim = causal_to_diag(attn_sim.masked_fill(mask, 0.))
+            attn_sim = attn_sim.masked_fill(mask, 0.)
 
         attn_features, inverse_pack = pack_with_inverse(attn_sim, 'b *')
 
@@ -243,11 +231,11 @@ class AttentionSchema(Module):
 
         recon = inverse_pack(self.decoder(quantized))
 
-        # shift back if causal
+        # mask to -inf if causal
 
         if self.causal:
             mask_value = -torch.finfo(attn_sim.dtype).max
-            recon = diag_to_causal(recon).masked_fill(mask, mask_value)
+            recon = recon.masked_fill(mask, mask_value)
 
         # early return if no loss
 
