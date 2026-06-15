@@ -18,7 +18,7 @@ from vector_quantize_pytorch import VectorQuantize
 
 from ema_pytorch import EMA
 
-from torch_einops_utils import pack_with_inverse, maybe
+from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim
 
 # helpers
 
@@ -30,6 +30,20 @@ def default(v, d):
 
 def is_empty(t):
     return len(t) == 0
+
+# causal attention schema trick
+
+def causal_to_diag(x):
+    *b_and_h, n, _ = x.shape
+    x = pad_left_at_dim(x, 1, dim = -2)
+    x = x.reshape(*b_and_h, n, n + 1)
+    return x[..., 1:]
+
+def diag_to_causal(x):
+    *b_and_h, n, _ = x.shape
+    x = pad_left_at_dim(x, 1, dim = -1)
+    x = x.reshape(*b_and_h, n + 1, n)
+    return x[..., 1:, :]
 
 # return types
 
@@ -176,6 +190,7 @@ class AttentionSchema(Module):
         decoder: Module | None = None,
         recon_loss_weight = 1.,
         commit_loss_weight = 1.,
+        causal = False,
         **vq_kwargs
     ):
         super().__init__()
@@ -195,6 +210,8 @@ class AttentionSchema(Module):
         self.kl_div_loss = kl_div_loss
         self.detach_target = detach_target
 
+        self.causal = causal
+
         self.recon_loss_weight = recon_loss_weight
         self.commit_loss_weight = commit_loss_weight
 
@@ -208,34 +225,62 @@ class AttentionSchema(Module):
     ):
         return_loss = default(return_loss, self.training)
 
+        target = default(target_sim, attn_sim)
+
+        # handle causal mask
+        # zero out upper right, then shift lower left to upper right for autoencoding
+
+        if self.causal:
+            n = attn_sim.shape[-1]
+            mask = attn_sim.new_ones(n, n, dtype = torch.bool).triu(1)
+            attn_sim = causal_to_diag(attn_sim.masked_fill(mask, 0.))
+
         attn_features, inverse_pack = pack_with_inverse(attn_sim, 'b *')
 
         encoded = self.encoder(attn_features)
 
         quantized, indices, commit_loss = self.vq(encoded)
 
-        decoded = self.decoder(quantized)
+        recon = inverse_pack(self.decoder(quantized))
 
-        recon = inverse_pack(decoded)
+        # shift back if causal
+
+        if self.causal:
+            mask_value = -torch.finfo(attn_sim.dtype).max
+            recon = diag_to_causal(recon).masked_fill(mask, mask_value)
+
+        # early return if no loss
+
+        if not return_loss:
+            total_loss = commit_loss * self.commit_loss_weight
+            return recon, indices, total_loss, (self.zero, commit_loss)
 
         # loss, mse as in paper or reverse kl
 
-        recon_loss = self.zero
+        target = target.detach() if self.detach_target else target
+        target = target.masked_fill(mask, mask_value) if self.causal else target
 
-        target = default(target_sim, attn_sim)
+        if self.kl_div_loss:
+            # kl div
 
-        if return_loss:
-            if self.detach_target:
-                target = target.detach()
+            loss = F.kl_div(
+                target.log_softmax(dim = -1),
+                recon.softmax(dim = -1),
+                reduction = 'none'
+            )
 
-            if self.kl_div_loss:
-                recon_loss = F.kl_div(
-                    target.log_softmax(dim = -1),
-                    recon.softmax(dim = -1),
-                    reduction = 'none'
-                ).sum(dim = -1).mean()
+            loss = loss.masked_fill(mask, 0.) if self.causal else loss
+            recon_loss = loss.sum(dim = -1).mean()
+        else:
+            # mse
+
+            loss = F.mse_loss(recon, target, reduction = 'none')
+
+            if self.causal:
+                valid_fraction = (~mask).float().mean()
+                recon_loss = loss.masked_fill(mask, 0.).mean() / valid_fraction
             else:
-                recon_loss = F.mse_loss(recon, target)
+                recon_loss = loss.mean()
 
         # total
 
