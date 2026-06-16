@@ -77,7 +77,7 @@ def test_autoregressive_schema_loss(use_awareness, use_meta_awareness):
     if use_meta_awareness and not use_awareness:
         pytest.skip('meta awareness requires awareness')
 
-    from ASAC.ASAC import ASAC, PatchEmbedding
+    from ASAC.ASAC import ASAC, PatchEmbedding, exists
 
     to_embedding = PatchEmbedding(dim = 32, patch_size = 4, channels = 3)
 
@@ -103,6 +103,21 @@ def test_autoregressive_schema_loss(use_awareness, use_meta_awareness):
     assert ret.attn_schema_indices.shape == (2, 64)
     assert ret.attn_schema_autoregressive_loss.ndim == 0
 
+    assert exists(ret.attns)
+    assert len(ret.attns) == 64
+
+    if use_awareness:
+        assert exists(ret.awareness_attns)
+        assert len(ret.awareness_attns) == 2
+    else:
+        assert not exists(ret.awareness_attns)
+
+    if use_meta_awareness:
+        assert exists(ret.meta_awareness_attns)
+        assert len(ret.meta_awareness_attns) == 2
+    else:
+        assert not exists(ret.meta_awareness_attns)
+
     import torch.nn.functional as F
     labels = torch.randint(0, 10, (2,))
     loss = F.cross_entropy(ret.logits, labels) + ret.attn_schema_autoregressive_loss
@@ -110,7 +125,7 @@ def test_autoregressive_schema_loss(use_awareness, use_meta_awareness):
 
 @pytest.mark.parametrize('causal', [False, True])
 def test_attention_schema(causal):
-    from ASAC.ASAC import AttentionSchema
+    from ASAC.ASAC import AttentionSchema, exists
 
     seq_len = 8
     heads = 4
@@ -126,5 +141,5 @@ def test_attention_schema(causal):
     recon, indices, loss, _ = schema(attn_sim)
 
     assert recon.shape == attn_sim.shape
-    assert indices is not None
+    assert exists(indices)
     assert loss.ndim == 0

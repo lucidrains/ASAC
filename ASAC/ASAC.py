@@ -30,9 +30,11 @@ def is_empty(t):
 
 # return types
 
-AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim', 'cache'])
-ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims', 'meta_awareness_attn_sims'])
+AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim', 'attn', 'cache'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims', 'meta_awareness_attn_sims', 'attns', 'awareness_attns', 'meta_awareness_attns'])
 AuxLossBreakdown = namedtuple('AuxLossBreakdown', ['recon_loss', 'commit_loss'])
+AttentionSchemaReturn = namedtuple('AttentionSchemaReturn', ['recon', 'indices', 'loss', 'loss_breakdown'])
+AwarenessReturn = namedtuple('AwarenessReturn', ['logits', 'embeds', 'attn_sims', 'attns', 'aux_loss', 'attn_schema_indices'])
 
 # feedforward
 
@@ -181,6 +183,7 @@ class Attention(Module):
             aux_loss,
             aux_loss_breakdown,
             orig_sim,
+            attn,
             new_cache
         )
 
@@ -254,7 +257,7 @@ class AttentionSchema(Module):
 
         if not return_loss:
             total_loss = commit_loss * self.commit_loss_weight
-            return recon, indices, total_loss, AuxLossBreakdown(self.zero, commit_loss)
+            return AttentionSchemaReturn(recon, indices, total_loss, AuxLossBreakdown(self.zero, commit_loss))
 
         # loss, mse as in paper or reverse kl
 
@@ -286,7 +289,7 @@ class AttentionSchema(Module):
 
         total_loss = recon_loss * self.recon_loss_weight + commit_loss * self.commit_loss_weight
 
-        return recon, indices, total_loss, AuxLossBreakdown(recon_loss, commit_loss)
+        return AttentionSchemaReturn(recon, indices, total_loss, AuxLossBreakdown(recon_loss, commit_loss))
 
 # autoregressive awareness model
 
@@ -336,6 +339,7 @@ class AutoregressiveAwareness(Module):
 
         total_aux_loss = 0.
         attn_sims = []
+        attns = []
         attn_schema_indices = []
 
         attn_schema_targets = default(attn_schema_targets, [None] * len(self.layers))
@@ -348,6 +352,7 @@ class AutoregressiveAwareness(Module):
 
             total_aux_loss = total_aux_loss + attn_out.aux_loss
             attn_sims.append(attn_out.attn_sim)
+            attns.append(attn_out.attn)
 
             if exists(attn_out.indices):
                 attn_schema_indices.append(attn_out.indices)
@@ -355,7 +360,7 @@ class AutoregressiveAwareness(Module):
         embeds = self.norm(x)
         logits = self.to_logits(embeds)
 
-        return logits, embeds, attn_sims, total_aux_loss, attn_schema_indices
+        return AwarenessReturn(logits, embeds, attn_sims, attns, total_aux_loss, attn_schema_indices)
 
 # class
 
@@ -484,12 +489,14 @@ class ASAC(Module):
 
         attn_schema_targets = default(attn_schema_targets, [None] * self.depth)
         attn_sims = []
+        attns = []
         attn_schema_indices = []
 
         for (attn, ff), target in zip(self.layers, attn_schema_targets):
             attn_out = attn(x, attn_schema_target = target)
 
             attn_sims.append(attn_out.attn_sim)
+            attns.append(attn_out.attn)
 
             if exists(attn_out.indices):
                 attn_schema_indices.append(attn_out.indices)
@@ -508,6 +515,8 @@ class ASAC(Module):
         attn_schema_autoregressive_loss = self.zero
         awareness_attn_sims = None
         meta_awareness_attn_sims = None
+        awareness_attns = None
+        meta_awareness_attns = None
 
         # handle schema indices
 
@@ -517,7 +526,7 @@ class ASAC(Module):
         # awareness model
 
         if exists(self.awareness_model) and exists(attn_schema_indices):
-            awareness_logits, awareness_embeddings, awareness_attn_sims, awareness_aux_loss, awareness_attn_schema_indices = self.awareness_model(
+            awareness_logits, awareness_embeddings, awareness_attn_sims, awareness_attns, awareness_aux_loss, awareness_attn_schema_indices = self.awareness_model(
                 attn_schema_indices,
                 attn_schema_targets = awareness_attn_schema_targets
             )
@@ -535,7 +544,7 @@ class ASAC(Module):
             awareness_attn_schema_indices = maybe(rearrange)(awareness_attn_schema_indices, 'depth b ... -> b (depth ...)')
 
             if exists(self.meta_awareness_model) and exists(awareness_attn_schema_indices):
-                meta_awareness_logits, meta_awareness_embeddings, meta_awareness_attn_sims, meta_awareness_aux_loss, _ = self.meta_awareness_model(
+                meta_awareness_logits, meta_awareness_embeddings, meta_awareness_attn_sims, meta_awareness_attns, meta_awareness_aux_loss, _ = self.meta_awareness_model(
                     awareness_attn_schema_indices,
                     attn_schema_targets = meta_awareness_attn_schema_targets
                 )
@@ -578,7 +587,10 @@ class ASAC(Module):
             attn_schema_indices,
             attn_schema_autoregressive_loss,
             awareness_attn_sims,
-            meta_awareness_attn_sims
+            meta_awareness_attn_sims,
+            attns,
+            awareness_attns,
+            meta_awareness_attns
         )
 
 # ema class
