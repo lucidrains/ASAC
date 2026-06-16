@@ -31,7 +31,7 @@ def is_empty(t):
 # return types
 
 AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim', 'cache'])
-ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims', 'meta_awareness_attn_sims'])
 AuxLossBreakdown = namedtuple('AuxLossBreakdown', ['recon_loss', 'commit_loss'])
 
 # feedforward
@@ -336,6 +336,7 @@ class AutoregressiveAwareness(Module):
 
         total_aux_loss = 0.
         attn_sims = []
+        attn_schema_indices = []
 
         attn_schema_targets = default(attn_schema_targets, [None] * len(self.layers))
 
@@ -348,10 +349,13 @@ class AutoregressiveAwareness(Module):
             total_aux_loss = total_aux_loss + attn_out.aux_loss
             attn_sims.append(attn_out.attn_sim)
 
+            if exists(attn_out.indices):
+                attn_schema_indices.append(attn_out.indices)
+
         embeds = self.norm(x)
         logits = self.to_logits(embeds)
 
-        return logits, embeds, attn_sims, total_aux_loss
+        return logits, embeds, attn_sims, total_aux_loss, attn_schema_indices
 
 # class
 
@@ -367,6 +371,8 @@ class ASAC(Module):
         dim_head = 64,
         num_classes = 10,
         use_asac = False,
+        use_awareness = False,
+        use_meta_awareness = False,
         dim_bottleneck = 256,
         vq_codebook_size = 256,
         recon_loss_weight = 1.,
@@ -379,6 +385,7 @@ class ASAC(Module):
         super().__init__()
 
         assert depth >= 2, 'depth must be at least 2'
+        assert not (use_meta_awareness and not use_awareness), 'meta awareness should only be on if awareness decoder is on already'
 
         self.depth = depth
 
@@ -408,8 +415,9 @@ class ASAC(Module):
         # autoregressive awareness model (attention schema theory)
 
         self.awareness_model = None
+        self.meta_awareness_model = None
 
-        if use_asac and exists(seq_len):
+        if use_asac and use_awareness and exists(seq_len):
             awareness_attn_schema = AttentionSchema(
                 dim = heads * (depth ** 2),
                 dim_bottleneck = dim_bottleneck,
@@ -433,6 +441,21 @@ class ASAC(Module):
 
             self.awareness_to_logits = MLP(dim, dim, num_classes, activation = nn.LeakyReLU())
 
+            # meditation
+
+            if use_meta_awareness:
+                self.meta_awareness_model = AutoregressiveAwareness(
+                    dim = dim,
+                    depth = awareness_model_depth,
+                    heads = heads,
+                    dim_head = dim_head,
+                    num_tokens = vq_codebook_size,
+                    max_seq_len = awareness_model_depth,
+                    stochastic_sample_attn = stochastic_sample_attn
+                )
+
+                self.meta_awareness_to_logits = MLP(dim, dim, num_classes, activation = nn.LeakyReLU())
+
         self.to_logits = nn.Sequential(
             nn.RMSNorm(dim),
             Linear(dim, num_classes)
@@ -447,6 +470,7 @@ class ASAC(Module):
         x,
         attn_schema_targets = None,
         awareness_attn_schema_targets = None,
+        meta_awareness_attn_schema_targets = None,
         use_awareness = True
     ):
         batch = x.shape[0]
@@ -483,6 +507,7 @@ class ASAC(Module):
 
         attn_schema_autoregressive_loss = self.zero
         awareness_attn_sims = None
+        meta_awareness_attn_sims = None
 
         # handle schema indices
 
@@ -492,7 +517,7 @@ class ASAC(Module):
         # awareness model
 
         if exists(self.awareness_model) and exists(attn_schema_indices):
-            awareness_logits, awareness_embeddings, awareness_attn_sims, awareness_aux_loss = self.awareness_model(
+            awareness_logits, awareness_embeddings, awareness_attn_sims, awareness_aux_loss, awareness_attn_schema_indices = self.awareness_model(
                 attn_schema_indices,
                 attn_schema_targets = awareness_attn_schema_targets
             )
@@ -504,20 +529,46 @@ class ASAC(Module):
             ce_loss = F.cross_entropy(rearrange(seq_logits, 'b n c -> b c n'), target)
             attn_schema_autoregressive_loss = ce_loss + awareness_aux_loss
 
+            # handle schema indices for meta awareness
+
+            awareness_attn_schema_indices = None if is_empty(awareness_attn_schema_indices) else awareness_attn_schema_indices
+            awareness_attn_schema_indices = maybe(rearrange)(awareness_attn_schema_indices, 'depth b ... -> b (depth ...)')
+
+            if exists(self.meta_awareness_model) and exists(awareness_attn_schema_indices):
+                meta_awareness_logits, meta_awareness_embeddings, meta_awareness_attn_sims, meta_awareness_aux_loss, _ = self.meta_awareness_model(
+                    awareness_attn_schema_indices,
+                    attn_schema_targets = meta_awareness_attn_schema_targets
+                )
+
+                meta_seq_logits = meta_awareness_logits[:, :-1]
+                meta_target = awareness_attn_schema_indices[:, 1:]
+                meta_ce_loss = F.cross_entropy(rearrange(meta_seq_logits, 'b n c -> b c n'), meta_target)
+                attn_schema_autoregressive_loss = attn_schema_autoregressive_loss + meta_ce_loss + meta_awareness_aux_loss
+
             # awareness modulation, that's the evolutionary argument for this theory
 
             if use_awareness:
                 last_embedding = awareness_embeddings[:, -1, :]
 
-                awareness_logits = self.awareness_to_logits(last_embedding)
+                awareness_logits_out = self.awareness_to_logits(last_embedding)
 
                 # awareness dropout
 
                 if self.training and self.has_awareness_dropout:
                     drop_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
-                    awareness_logits = einx.where('b, , b d -> b d', drop_awareness, 0., awareness_logits)
+                    awareness_logits_out = einx.where('b, , b d -> b d', drop_awareness, 0., awareness_logits_out)
 
-                logits = logits + awareness_logits
+                logits = logits + awareness_logits_out
+
+                if exists(self.meta_awareness_model) and exists(awareness_attn_schema_indices):
+                    last_meta_embedding = meta_awareness_embeddings[:, -1, :]
+                    meta_awareness_logits_out = self.meta_awareness_to_logits(last_meta_embedding)
+
+                    if self.training and self.has_awareness_dropout:
+                        drop_meta_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
+                        meta_awareness_logits_out = einx.where('b, , b d -> b d', drop_meta_awareness, 0., meta_awareness_logits_out)
+
+                    logits = logits + meta_awareness_logits_out
 
         return ASACReturn(
             logits,
@@ -526,7 +577,8 @@ class ASAC(Module):
             attn_sims,
             attn_schema_indices,
             attn_schema_autoregressive_loss,
-            awareness_attn_sims
+            awareness_attn_sims,
+            meta_awareness_attn_sims
         )
 
 # ema class
@@ -559,7 +611,7 @@ class EMA_ASAC(Module):
             self.ema_model.eval()
             ema_outputs = self.ema_model(*args, **kwargs)
 
-            ema_targets, ema_awareness_targets = tree_map_tensor(lambda t: t.detach(), (ema_outputs.attn_sims, ema_outputs.awareness_attn_sims))
+            ema_targets, ema_awareness_targets, ema_meta_awareness_targets = tree_map_tensor(lambda t: t.detach(), (ema_outputs.attn_sims, ema_outputs.awareness_attn_sims, ema_outputs.meta_awareness_attn_sims))
 
             self.ema_model.train()
 
@@ -567,5 +619,6 @@ class EMA_ASAC(Module):
             *args,
             attn_schema_targets = ema_targets,
             awareness_attn_schema_targets = ema_awareness_targets,
+            meta_awareness_attn_schema_targets = ema_meta_awareness_targets,
             **kwargs
         )

@@ -1,6 +1,6 @@
 [project]
 name = "ASAC-pytorch"
-version = "0.0.15"
+version = "0.0.16"
 description = "Implementation of Attention Schema-based Attention Control (ASAC)"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

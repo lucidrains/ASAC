@@ -1,8 +1,13 @@
 import pytest
 import torch
 
+@pytest.mark.parametrize('use_meta_awareness', [False, True])
+@pytest.mark.parametrize('use_awareness', [False, True])
 @pytest.mark.parametrize('use_asac', [False, True])
-def test_asac(use_asac):
+def test_asac(use_asac, use_awareness, use_meta_awareness):
+    if use_meta_awareness and not use_awareness:
+        pytest.skip('meta awareness requires awareness')
+
     from ASAC.ASAC import ASAC, Attention, AttentionSchema, PatchEmbedding
 
     from torch import nn
@@ -16,7 +21,9 @@ def test_asac(use_asac):
         heads = 8,
         seq_len = 64,
         to_embedding = to_embedding,
-        use_asac = use_asac
+        use_asac = use_asac,
+        use_awareness = use_awareness,
+        use_meta_awareness = use_meta_awareness
     )
 
     data = torch.randn(1, 3, 256, 256)
@@ -31,7 +38,12 @@ def test_asac(use_asac):
     out = attn(tokens)
     out.aux_loss.backward()
 
-def test_ema_asac():
+@pytest.mark.parametrize('use_meta_awareness', [False, True])
+@pytest.mark.parametrize('use_awareness', [False, True])
+def test_ema_asac(use_awareness, use_meta_awareness):
+    if use_meta_awareness and not use_awareness:
+        pytest.skip('meta awareness requires awareness')
+
     from ASAC.ASAC import ASAC, PatchEmbedding, EMA_ASAC
 
     to_embedding = PatchEmbedding(dim = 512, patch_size = 32, channels = 3)
@@ -42,7 +54,9 @@ def test_ema_asac():
         heads = 8,
         seq_len = 64,
         to_embedding = to_embedding,
-        use_asac = True
+        use_asac = True,
+        use_awareness = use_awareness,
+        use_meta_awareness = use_meta_awareness
     )
 
     ema_asac = EMA_ASAC(asac)
@@ -57,8 +71,12 @@ def test_ema_asac():
     ema_ret = ema_asac(data, use_ema = True)
     assert ema_ret.logits.shape == ret.logits.shape
 
+@pytest.mark.parametrize('use_meta_awareness', [False, True])
 @pytest.mark.parametrize('use_awareness', [True, False])
-def test_autoregressive_schema_loss(use_awareness):
+def test_autoregressive_schema_loss(use_awareness, use_meta_awareness):
+    if use_meta_awareness and not use_awareness:
+        pytest.skip('meta awareness requires awareness')
+
     from ASAC.ASAC import ASAC, PatchEmbedding
 
     to_embedding = PatchEmbedding(dim = 32, patch_size = 4, channels = 3)
@@ -73,6 +91,8 @@ def test_autoregressive_schema_loss(use_awareness):
         vq_codebook_size = 32,
         to_embedding = to_embedding,
         use_asac = True,
+        use_awareness = use_awareness,
+        use_meta_awareness = use_meta_awareness,
         stochastic_sample_attn = True
     )
 
