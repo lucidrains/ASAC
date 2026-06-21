@@ -190,7 +190,9 @@ class Attention(Module):
 class AwarenessDrivenAttention(Module):
     def __init__(self, dim, seq_len, dim_head, heads = 8, kv_heads = 2, k_rmsnorm = True):
         super().__init__()
+        self.dim = dim
         self.seq_len = seq_len
+        self.dim_head = dim_head
         self.scale = dim_head ** -0.5
 
         self.heads = heads
@@ -203,10 +205,10 @@ class AwarenessDrivenAttention(Module):
         self.q_rmsnorm = nn.RMSNorm(dim_head)
         self.k_rmsnorm = nn.RMSNorm(dim_head) if k_rmsnorm else None
 
-        self.awareness_to_q = nn.Sequential(
+        self.awareness_to_q_and_gate = nn.Sequential(
             Linear(dim, dim * 2),
             nn.SiLU(),
-            Linear(dim * 2, heads * seq_len * dim_head)
+            Linear(dim * 2, heads * seq_len * dim_head + heads * dim_head)
         )
 
         self.to_v = Linear(dim, kv_heads * dim_head, bias = False)
@@ -230,7 +232,9 @@ class AwarenessDrivenAttention(Module):
         # generate pseudo queries from awareness embed
         # and use shared key / values from the backbone itself
 
-        q = self.awareness_to_q(awareness_embed)
+        q_and_gate = self.awareness_to_q_and_gate(awareness_embed)
+        q, gate = q_and_gate.split([self.heads * self.seq_len * self.dim_head, self.heads * self.dim_head], dim = -1)
+
         q = rearrange(q, 'b (h n d) -> b h n d', h = self.heads, n = self.seq_len)
         q = self.q_rmsnorm(q)
 
@@ -242,8 +246,13 @@ class AwarenessDrivenAttention(Module):
 
         out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
+        gate = rearrange(gate, 'b (h d) -> b h 1 d', h = self.heads)
+        out = out * gate.sigmoid()
+
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out), attn
+        out = self.to_out(out)
+
+        return out, attn
 
 class AwarenessDrivenModulation(Module):
     def __init__(
