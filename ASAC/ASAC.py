@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn, tensor
 from torch.nn import Module, Linear, ModuleList
 
-from einops import einsum, reduce, rearrange
+from einops import einsum, reduce, rearrange, repeat
 from einops.layers.torch import Rearrange
 import einx
 
@@ -31,7 +31,7 @@ def is_empty(t):
 # return types
 
 AttentionReturn = namedtuple('AttentionReturn', ['attended', 'indices', 'aux_loss', 'aux_loss_breakdown', 'attn_sim', 'attn', 'cache'])
-ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims', 'meta_awareness_attn_sims', 'attns', 'awareness_attns', 'meta_awareness_attns'])
+ASACReturn = namedtuple('ASACReturn', ['logits', 'aux_loss', 'aux_loss_breakdown', 'attn_sims', 'attn_schema_indices', 'attn_schema_autoregressive_loss', 'awareness_attn_sims', 'meta_awareness_attn_sims', 'attns', 'awareness_attns', 'meta_awareness_attns', 'awareness_driven_attns'])
 AuxLossBreakdown = namedtuple('AuxLossBreakdown', ['recon_loss', 'commit_loss'])
 AttentionSchemaReturn = namedtuple('AttentionSchemaReturn', ['recon', 'indices', 'loss', 'loss_breakdown'])
 AwarenessReturn = namedtuple('AwarenessReturn', ['logits', 'embeds', 'attn_sims', 'attns', 'aux_loss', 'attn_schema_indices'])
@@ -187,6 +187,112 @@ class Attention(Module):
             new_cache
         )
 
+class AwarenessDrivenAttention(Module):
+    def __init__(self, dim, seq_len, dim_head, heads = 8, kv_heads = 2, k_rmsnorm = True):
+        super().__init__()
+        self.seq_len = seq_len
+        self.scale = dim_head ** -0.5
+
+        self.heads = heads
+        self.kv_heads = kv_heads
+
+        assert (heads % kv_heads) == 0, 'heads must be divisible by kv_heads'
+
+        self.norm = nn.RMSNorm(dim)
+
+        self.q_rmsnorm = nn.RMSNorm(dim_head)
+        self.k_rmsnorm = nn.RMSNorm(dim_head) if k_rmsnorm else None
+
+        self.awareness_to_q = nn.Sequential(
+            Linear(dim, dim * 2),
+            nn.SiLU(),
+            Linear(dim * 2, heads * seq_len * dim_head)
+        )
+
+        self.to_v = Linear(dim, kv_heads * dim_head, bias = False)
+        self.to_out = Linear(heads * dim_head, dim, bias = False)
+
+    def forward(self, x, awareness_embed):
+        n = x.shape[-2]
+
+        x = self.norm(x)
+
+        v = self.to_v(x)
+        v = rearrange(v, 'b n (h d) -> b h n d', h = self.kv_heads)
+        k = maybe(self.k_rmsnorm)(v)
+
+        # repeat k and v for gqa
+        num_kv_groups = self.heads // self.kv_heads
+
+        k = repeat(k, 'b h n d -> b (h g) n d', g = num_kv_groups)
+        v = repeat(v, 'b h n d -> b (h g) n d', g = num_kv_groups)
+
+        # generate pseudo queries from awareness embed
+        # and use shared key / values from the backbone itself
+
+        q = self.awareness_to_q(awareness_embed)
+        q = rearrange(q, 'b (h n d) -> b h n d', h = self.heads, n = self.seq_len)
+        q = self.q_rmsnorm(q)
+
+        q = q[:, :, :n]
+
+        attn_matrix = einsum(q, k, 'b h i d, b h j d -> b h i j') * self.scale
+
+        attn = attn_matrix.softmax(dim = -1)
+
+        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out), attn
+
+class AwarenessDrivenModulation(Module):
+    def __init__(
+        self,
+        dim,
+        depth,
+        seq_len,
+        dim_head,
+        heads = 8,
+        kv_heads = 2,
+        awareness_dropout_prob = 0.
+    ):
+        super().__init__()
+        self.depth = depth
+        self.awareness_dropout_prob = awareness_dropout_prob
+        self.has_awareness_dropout = awareness_dropout_prob > 0.
+
+        self.layers = ModuleList([ModuleList([
+            AwarenessDrivenAttention(dim, seq_len = seq_len, dim_head = dim_head, heads = heads, kv_heads = kv_heads),
+            FeedForward(dim)
+        ]) for _ in range(depth)])
+
+    def forward(
+        self,
+        x,               # b n d
+        awareness_embed  # b d
+    ):
+        attns = []
+
+        drop_awareness_mask = None
+        if self.training and self.has_awareness_dropout:
+            drop_awareness_mask = torch.rand(x.shape[0], device = x.device) < self.awareness_dropout_prob
+
+        orig_x = x
+
+        for attn, ff in self.layers:
+            out, post_softmax_attn = attn(x, awareness_embed)
+            attns.append(post_softmax_attn)
+
+            x = out + x
+            x = ff(x) + x
+
+        # awareness dropout
+
+        if exists(drop_awareness_mask):
+            x = einx.where('b, , b n d -> b n d', drop_awareness_mask, orig_x, x)
+
+        return x, attns
+
 # attention autoencoder
 
 class AttentionSchema(Module):
@@ -309,20 +415,17 @@ class AutoregressiveAwareness(Module):
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.pos_emb = nn.Embedding(max_seq_len, dim)
 
-        self.layers = ModuleList([])
-
-        for _ in range(depth):
-            self.layers.append(ModuleList([
-                Attention(
-                    dim = dim,
-                    dim_head = dim_head,
-                    heads = heads,
-                    causal = True,
-                    attn_schema = attn_schema,
-                    stochastic_sample_attn = stochastic_sample_attn
-                ),
-                FeedForward(dim)
-            ]))
+        self.layers = ModuleList([ModuleList([
+            Attention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads,
+                causal = True,
+                attn_schema = attn_schema,
+                stochastic_sample_attn = stochastic_sample_attn
+            ),
+            FeedForward(dim)
+        ]) for _ in range(depth)])
 
         self.norm = nn.RMSNorm(dim)
         self.to_logits = Linear(dim, num_tokens)
@@ -385,11 +488,15 @@ class ASAC(Module):
         kl_div_loss = True,
         stochastic_sample_attn = False,
         awareness_dropout_prob = 0.,
-        awareness_model_depth = 2
+        awareness_model_depth = 2,
+        awareness_driven_depth = 1,
+        awareness_driven_heads = 8,
+        awareness_driven_kv_heads = 2
     ):
         super().__init__()
 
         assert depth >= 2, 'depth must be at least 2'
+        self.awareness_driven_depth = awareness_driven_depth
         assert not (use_meta_awareness and not use_awareness), 'meta awareness should only be on if awareness decoder is on already'
 
         self.depth = depth
@@ -444,7 +551,15 @@ class ASAC(Module):
                 stochastic_sample_attn = stochastic_sample_attn
             )
 
-            self.awareness_to_logits = MLP(dim, dim, num_classes, activation = nn.LeakyReLU())
+            self.awareness_driven_modulation = AwarenessDrivenModulation(
+                dim = dim,
+                depth = awareness_driven_depth,
+                seq_len = seq_len,
+                dim_head = dim_head,
+                heads = awareness_driven_heads,
+                kv_heads = awareness_driven_kv_heads,
+                awareness_dropout_prob = awareness_dropout_prob
+            )
 
             # meditation
 
@@ -458,8 +573,6 @@ class ASAC(Module):
                     max_seq_len = awareness_model_depth,
                     stochastic_sample_attn = stochastic_sample_attn
                 )
-
-                self.meta_awareness_to_logits = MLP(dim, dim, num_classes, activation = nn.LeakyReLU())
 
         self.to_logits = nn.Sequential(
             nn.RMSNorm(dim),
@@ -487,7 +600,7 @@ class ASAC(Module):
 
         total_aux_loss = total_recon_loss = total_commit_loss = 0.
 
-        attn_schema_targets = default(attn_schema_targets, [None] * self.depth)
+        attn_schema_targets = default(attn_schema_targets, [None] * len(self.layers))
         attn_sims = []
         attns = []
         attn_schema_indices = []
@@ -508,20 +621,16 @@ class ASAC(Module):
             total_recon_loss = total_recon_loss + attn_out.aux_loss_breakdown.recon_loss
             total_commit_loss = total_commit_loss + attn_out.aux_loss_breakdown.commit_loss
 
-        x = reduce(x, 'b n d -> b d', 'mean')
-
-        logits = self.to_logits(x)
-
         attn_schema_autoregressive_loss = self.zero
         awareness_attn_sims = None
         meta_awareness_attn_sims = None
         awareness_attns = None
         meta_awareness_attns = None
+        awareness_driven_attns = None
 
         # handle schema indices
 
-        attn_schema_indices = None if is_empty(attn_schema_indices) else attn_schema_indices
-        attn_schema_indices = maybe(rearrange)(attn_schema_indices, 'depth b ... -> b (depth ...)')
+        attn_schema_indices = rearrange(attn_schema_indices, 'depth b ... -> b (depth ...)') if not is_empty(attn_schema_indices) else None
 
         # awareness model
 
@@ -533,15 +642,11 @@ class ASAC(Module):
 
             # autoregressive loss on schema indices
 
-            seq_logits = awareness_logits[:, :-1]
-            target = attn_schema_indices[:, 1:]
-            ce_loss = F.cross_entropy(rearrange(seq_logits, 'b n c -> b c n'), target)
-            attn_schema_autoregressive_loss = ce_loss + awareness_aux_loss
+            attn_schema_autoregressive_loss = F.cross_entropy(awareness_logits[:, :-1].flatten(0, 1), attn_schema_indices[:, 1:].flatten()) + awareness_aux_loss
 
             # handle schema indices for meta awareness
 
-            awareness_attn_schema_indices = None if is_empty(awareness_attn_schema_indices) else awareness_attn_schema_indices
-            awareness_attn_schema_indices = maybe(rearrange)(awareness_attn_schema_indices, 'depth b ... -> b (depth ...)')
+            awareness_attn_schema_indices = rearrange(awareness_attn_schema_indices, 'depth b ... -> b (depth ...)') if not is_empty(awareness_attn_schema_indices) else None
 
             if exists(self.meta_awareness_model) and exists(awareness_attn_schema_indices):
                 meta_awareness_logits, meta_awareness_embeddings, meta_awareness_attn_sims, meta_awareness_attns, meta_awareness_aux_loss, _ = self.meta_awareness_model(
@@ -549,35 +654,19 @@ class ASAC(Module):
                     attn_schema_targets = meta_awareness_attn_schema_targets
                 )
 
-                meta_seq_logits = meta_awareness_logits[:, :-1]
-                meta_target = awareness_attn_schema_indices[:, 1:]
-                meta_ce_loss = F.cross_entropy(rearrange(meta_seq_logits, 'b n c -> b c n'), meta_target)
+                meta_ce_loss = F.cross_entropy(meta_awareness_logits[:, :-1].flatten(0, 1), awareness_attn_schema_indices[:, 1:].flatten())
                 attn_schema_autoregressive_loss = attn_schema_autoregressive_loss + meta_ce_loss + meta_awareness_aux_loss
 
-            # awareness modulation, that's the evolutionary argument for this theory
+            # awareness modulation - the evolutionary argument for attention schema theory
+            # a simple attention block where the attention matrix is produced by the awareness
+            # the awareness produces the next attention matrix via in-context learning of schema indices
 
             if use_awareness:
-                last_embedding = awareness_embeddings[:, -1, :]
+                x, awareness_driven_attns = self.awareness_driven_modulation(x, awareness_embeddings[:, -1])
 
-                awareness_logits_out = self.awareness_to_logits(last_embedding)
+        x = reduce(x, 'b n d -> b d', 'mean')
 
-                # awareness dropout
-
-                if self.training and self.has_awareness_dropout:
-                    drop_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
-                    awareness_logits_out = einx.where('b, , b d -> b d', drop_awareness, 0., awareness_logits_out)
-
-                logits = logits + awareness_logits_out
-
-                if exists(self.meta_awareness_model) and exists(awareness_attn_schema_indices):
-                    last_meta_embedding = meta_awareness_embeddings[:, -1, :]
-                    meta_awareness_logits_out = self.meta_awareness_to_logits(last_meta_embedding)
-
-                    if self.training and self.has_awareness_dropout:
-                        drop_meta_awareness = torch.rand(batch, device = x.device) < self.awareness_dropout_prob
-                        meta_awareness_logits_out = einx.where('b, , b d -> b d', drop_meta_awareness, 0., meta_awareness_logits_out)
-
-                    logits = logits + meta_awareness_logits_out
+        logits = self.to_logits(x)
 
         return ASACReturn(
             logits,
@@ -590,22 +679,29 @@ class ASAC(Module):
             meta_awareness_attn_sims,
             attns,
             awareness_attns,
-            meta_awareness_attns
+            meta_awareness_attns,
+            awareness_driven_attns
         )
 
 # ema class
 
 class EMA_ASAC(Module):
+    DEFAULT_EMA_KWARGS = dict(
+        beta = 0.99,
+        update_after_step = 1000,
+        update_every = 10
+    )
+
     def __init__(
         self,
         asac,
-        ema_decay = 0.999,
-        **ema_kwargs
+        ema_kwargs: dict = None
     ):
         super().__init__()
-        self.asac = asac
+        ema_kwargs = default(ema_kwargs, self.DEFAULT_EMA_KWARGS)
 
-        self.ema_model = EMA(asac, beta = ema_decay, **ema_kwargs)
+        self.asac = asac
+        self.ema_model = EMA(asac, **ema_kwargs)
 
     def update(self):
         self.ema_model.update()

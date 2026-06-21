@@ -109,8 +109,11 @@ def test_autoregressive_schema_loss(use_awareness, use_meta_awareness):
     if use_awareness:
         assert exists(ret.awareness_attns)
         assert len(ret.awareness_attns) == 2
+        assert exists(ret.awareness_driven_attns)
+        assert len(ret.awareness_driven_attns) == 1
     else:
         assert not exists(ret.awareness_attns)
+        assert not exists(ret.awareness_driven_attns)
 
     if use_meta_awareness:
         assert exists(ret.meta_awareness_attns)

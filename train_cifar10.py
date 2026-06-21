@@ -35,6 +35,7 @@ from ASAC import ASAC, PatchEmbedding, EMA_ASAC
 
 def main(
     use_asac: bool = False,
+    use_awareness: bool = False,
     use_ema_targets: bool = False,
     ema_decay: float = 0.999,
     eval_use_base: bool = False,
@@ -53,6 +54,8 @@ def main(
     accelerator = Accelerator(cpu = cpu, log_with = 'wandb')
 
     run_name = 'asac' if use_asac else 'baseline'
+    if use_awareness:
+        run_name += '-aware'
     if use_asac and kl_div_loss:
         run_name += '-kldiv'
 
@@ -85,13 +88,14 @@ def main(
         seq_len = 64,
         to_embedding = to_embedding,
         use_asac = use_asac,
+        use_awareness = use_awareness,
         recon_loss_weight = recon_loss_weight,
         commit_loss_weight = commit_loss_weight,
         kl_div_loss = kl_div_loss
     )
 
     if use_ema_targets:
-        model = EMA_ASAC(model, ema_decay = ema_decay)
+        model = EMA_ASAC(model, ema_kwargs = dict(beta = ema_decay))
 
     optimizer = optim.AdamW(model.parameters(), lr = lr, weight_decay = 1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
@@ -110,7 +114,8 @@ def main(
             outputs, aux_loss, (recon_loss, commit_loss) = ret.logits, ret.aux_loss, ret.aux_loss_breakdown
 
             loss = F.cross_entropy(outputs, targets)
-            accelerator.backward(loss + aux_loss)
+            total_loss = loss + aux_loss + ret.attn_schema_autoregressive_loss
+            accelerator.backward(total_loss)
             optimizer.step()
 
             if use_ema_targets:
